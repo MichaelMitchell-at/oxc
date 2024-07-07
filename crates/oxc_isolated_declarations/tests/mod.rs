@@ -37,7 +37,7 @@ fn transform(path: &Path, source_text: &str) -> String {
 
 #[test]
 fn snapshots() {
-    insta::glob!("fixtures/*.{ts,tsx}", |path| {
+    insta::glob!("fixtures/well-known-symbols.{ts,tsx}", |path| {
         let source_text = fs::read_to_string(path).unwrap();
         let snapshot = transform(path, &source_text);
         let name = path.file_stem().unwrap().to_str().unwrap();

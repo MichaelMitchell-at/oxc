@@ -32,8 +32,15 @@ impl<'a> IsolatedDeclarations<'a> {
 
     pub fn report_property_key(&self, key: &PropertyKey<'a>, computed: bool) -> bool {
         if computed && !self.is_literal_key(key) {
-            self.error(computed_property_name(key.span()));
-            true
+            if self
+                .global_symbol_binding_tracker
+                .does_computed_property_reference_well_known_symbol(key)
+            {
+                false
+            } else {
+                self.error(computed_property_name(key.span()));
+                true
+            }
         } else {
             false
         }
@@ -273,21 +280,69 @@ impl<'a> IsolatedDeclarations<'a> {
     fn collect_inferred_accessor_types(
         &self,
         decl: &Class<'a>,
-    ) -> FxHashMap<Atom, Box<'a, TSTypeAnnotation<'a>>> {
-        let mut inferred_accessor_types: FxHashMap<Atom<'a>, Box<'a, TSTypeAnnotation<'a>>> =
-            FxHashMap::default();
+    ) -> (
+        FxHashMap<Atom, Box<'a, TSTypeAnnotation<'a>>>,
+        FxHashMap<Atom, Box<'a, TSTypeAnnotation<'a>>>,
+    ) {
+        let mut inferred_accessor_types_for_static_name: FxHashMap<
+            Atom<'a>,
+            Box<'a, TSTypeAnnotation<'a>>,
+        > = FxHashMap::default();
+
+        let mut inferred_accessor_types_for_well_known_symbol: FxHashMap<
+            Atom<'a>,
+            Box<'a, TSTypeAnnotation<'a>>,
+        > = FxHashMap::default();
 
         for element in &decl.body.body {
             if let ClassElement::MethodDefinition(method) = element {
                 if method.key.is_private_identifier()
                     || method.accessibility.is_some_and(TSAccessibility::is_private)
-                    || (method.computed && !self.is_literal_key(&method.key))
                 {
                     continue;
                 }
-                let Some(name) = method.key.static_name() else {
+                let Some((name, is_static)) =
+                    method.key.static_name().map(|name| (name, true)).or_else(|| {
+                        if let PropertyKey::StaticMemberExpression(expr) = &method.key {
+                            match &expr.object {
+                                Expression::Identifier(object_identifier) => {
+                                    if object_identifier.name == "Symbol" {
+                                        Some((expr.property.name.clone().into(), false))
+                                    } else {
+                                        None
+                                    }
+                                }
+                                Expression::StaticMemberExpression(static_member) => {
+                                    if let Expression::Identifier(identifier) =
+                                        &static_member.object
+                                    {
+                                        if identifier.name == "globalThis"
+                                            && static_member.property.name == "Symbol"
+                                        {
+                                            Some((expr.property.name.clone().into(), false))
+                                        } else {
+                                            None
+                                        }
+                                    } else {
+                                        None
+                                    }
+                                }
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        }
+                    })
+                else {
                     continue;
                 };
+
+                let inferred_accessor_types = if is_static {
+                    &mut inferred_accessor_types_for_static_name
+                } else {
+                    &mut inferred_accessor_types_for_well_known_symbol
+                };
+
                 let name = self.ast.atom(&name);
                 if inferred_accessor_types.contains_key(&name) {
                     // We've inferred that accessor type already
@@ -327,7 +382,7 @@ impl<'a> IsolatedDeclarations<'a> {
             }
         }
 
-        inferred_accessor_types
+        (inferred_accessor_types_for_static_name, inferred_accessor_types_for_well_known_symbol)
     }
 
     pub fn transform_class(
@@ -380,7 +435,11 @@ impl<'a> IsolatedDeclarations<'a> {
                         continue;
                     }
 
-                    let inferred_accessor_types = self.collect_inferred_accessor_types(decl);
+                    let (
+                        inferred_accessor_types_for_static_name,
+                        inferred_accessor_types_for_well_known_symbol,
+                    ) = self.collect_inferred_accessor_types(decl);
+
                     let function = &method.value;
                     let params = if method.kind.is_set() {
                         method.key.static_name().map_or_else(
@@ -388,10 +447,12 @@ impl<'a> IsolatedDeclarations<'a> {
                             |n| {
                                 self.transform_set_accessor_params(
                                     &function.params,
-                                    inferred_accessor_types.get(&self.ast.atom(&n)).map(|t| {
-                                        // SAFETY: `ast.copy` is unsound! We need to fix.
-                                        unsafe { self.ast.copy(t) }
-                                    }),
+                                    inferred_accessor_types_for_static_name
+                                        .get(&self.ast.atom(&n))
+                                        .map(|t| {
+                                            // SAFETY: `ast.copy` is unsound! We need to fix.
+                                            unsafe { self.ast.copy(t) }
+                                        }),
                                 )
                             },
                         )
@@ -419,11 +480,31 @@ impl<'a> IsolatedDeclarations<'a> {
                         }
                         MethodDefinitionKind::Get => {
                             let rt = method.key.static_name().and_then(|name| {
-                                inferred_accessor_types.get(&self.ast.atom(&name)).map(|t| {
-                                    // SAFETY: `ast.copy` is unsound! We need to fix.
-                                    unsafe { self.ast.copy(t) }
-                                })
+                                inferred_accessor_types_for_static_name.get(&self.ast.atom(&name))
+                            }).or_else(|| {
+                                if let PropertyKey::StaticMemberExpression(expr) = &method.key {
+                                    match &expr.object {
+                                        Expression::Identifier(object_identifier) => {
+                                            if object_identifier.name == "Symbol" {
+                                                return inferred_accessor_types_for_well_known_symbol.get(&expr.property.name)
+                                            }
+                                        }
+                                        Expression::StaticMemberExpression(static_member) => {
+                                            if let Expression::Identifier(identifier) = &static_member.object {
+                                                if identifier.name == "globalThis" && static_member.property.name == "Symbol" {
+                                                    return inferred_accessor_types_for_well_known_symbol.get(&expr.property.name)
+                                                }
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                None
+                            }).map(|t| {
+                                // SAFETY: `ast.copy` is unsound! We need to fix.
+                                unsafe { self.ast.copy(t) }
                             });
+
                             if rt.is_none() {
                                 self.error(accessor_must_have_explicit_return_type(
                                     method.key.span(),
